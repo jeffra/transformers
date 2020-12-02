@@ -52,12 +52,36 @@ try:
 except ImportError:
     from tensorboardX import SummaryWriter
 
+import deepspeed
+import transformers
 
 logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_QUESTION_ANSWERING_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
+#import transformers
+#import deepspeed
+#
+#def replace_ds(model, args, config):
+#    return deepspeed.replace_transformer_layer(
+#           orig_layer_impl=transformers.modeling_bert.BertLayer,
+#           model=model,
+#           micro_batch_size=args.per_gpu_train_batch_size,
+#           bert_config=config,
+#           seed=args.seed,
+#           max_seq_length=args.max_seq_length,
+#           preln=False,
+#           fp16=args.fp16,
+#           huggingface=True
+#    )
+#
+#def revert_ds(model):
+#    return deepspeed.revert_transformer_layer(
+#           orig_layer_impl=transformers.modeling_bert.BertLayer,
+#           model=model,
+#           bert_config=config,
+#           preln=False)
 
 def set_seed(args):
     random.seed(args.seed)
@@ -71,7 +95,7 @@ def to_list(tensor):
     return tensor.detach().cpu().tolist()
 
 
-def train(args, train_dataset, model, tokenizer):
+def train(args, train_dataset, model, tokenizer): #, config):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
@@ -166,7 +190,7 @@ def train(args, train_dataset, model, tokenizer):
     )
     # Added here for reproductibility
     set_seed(args)
-
+    import sys
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
@@ -199,9 +223,18 @@ def train(args, train_dataset, model, tokenizer):
                         {"langs": (torch.ones(batch[0].shape, dtype=torch.int64) * args.lang_id).to(args.device)}
                     )
 
+            #input_shapes = f"\n step={step} input batch shapes:\n"
+            #for k,v in inputs.items():
+            #    input_shapes += f"{k}={v.shape} \n"
+            #print(input_shapes)
+            # print(f"model type: {type(model.module)}", flush=True)
             outputs = model(**inputs)
+            # print(f"outputs={outputs}", flush=True)
             # model outputs are always tuple in transformers (see doc)
+            #print(outputs)
             loss = outputs[0]
+            #print (loss)
+            #exit()
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel (not distributed) training
@@ -226,6 +259,7 @@ def train(args, train_dataset, model, tokenizer):
                 model.zero_grad()
                 global_step += 1
 
+                #print("loss= {0}, global step= {1}".format(tr_loss, global_step))
                 # Log metrics
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Only evaluate when single GPU otherwise metrics may not average well
@@ -236,14 +270,16 @@ def train(args, train_dataset, model, tokenizer):
                     tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
                     logging_loss = tr_loss
-
+                
                 # Save model checkpoint
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     output_dir = os.path.join(args.output_dir, "checkpoint-{}".format(global_step))
                     if not os.path.exists(output_dir):
                         os.makedirs(output_dir)
-                    # Take care of distributed/parallel training
+                    # Take care of distributed/parallel training and ds conversion
+                    #model = revert_ds(model)
                     model_to_save = model.module if hasattr(model, "module") else model
+
                     model_to_save.save_pretrained(output_dir)
                     tokenizer.save_pretrained(output_dir)
 
@@ -253,6 +289,8 @@ def train(args, train_dataset, model, tokenizer):
                     torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                     torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
                     logger.info("Saving optimizer and scheduler states to %s", output_dir)
+                    # revert back to ds mode
+                    #model = replace_ds(model, args, config)
 
             if args.max_steps > 0 and global_step > args.max_steps:
                 epoch_iterator.close()
@@ -742,6 +780,24 @@ def main():
         cache_dir=args.cache_dir if args.cache_dir else None,
     )
 
+    # deepspeed inject transformer kernel
+    #model = replace_ds(model, args, config)
+    model = deepspeed.replace_transformer_layer(
+           orig_layer_impl=transformers.modeling_bert.BertLayer,
+           model=model,
+           micro_batch_size=args.per_gpu_train_batch_size,
+           bert_config=config,
+           seed=args.seed,
+           max_seq_length=args.max_seq_length,
+           preln=False,
+           fp16=args.fp16,
+           huggingface=True
+    )
+
+    print("post-injected model {}".format(model))
+    #print("post-revert model {}".format(model))
+    #model = revert_ds(model)
+
     if args.local_rank == 0:
         # Make sure only the first process in distributed training will download model & vocab
         torch.distributed.barrier()
@@ -761,10 +817,11 @@ def main():
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
 
+        
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False, output_examples=False)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer) #, config)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Save the trained model and the tokenizer
@@ -778,6 +835,13 @@ def main():
         # They can then be reloaded using `from_pretrained()`
         # Take care of distributed/parallel training
         model_to_save = model.module if hasattr(model, "module") else model
+        # revert before saving checkpoint
+        model_to_save = deepspeed.revert_transformer_layer(
+            orig_layer_impl=transformers.modeling_bert.BertLayer,
+            model=model_to_save,
+            bert_config=config,
+            preln=False)
+
         model_to_save.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
 
@@ -788,6 +852,18 @@ def main():
         model = AutoModelForQuestionAnswering.from_pretrained(args.output_dir)  # , force_download=True)
         tokenizer = AutoTokenizer.from_pretrained(args.output_dir, do_lower_case=args.do_lower_case)
         model.to(args.device)
+        # add ds back to model
+        #model = replace_ds(model, args, config)
+        model = deepspeed.replace_transformer_layer(
+           orig_layer_impl=transformers.modeling_bert.BertLayer,
+           model=model,
+           micro_batch_size=args.per_gpu_train_batch_size,
+           bert_config=config,
+           seed=args.seed,
+           max_seq_length=args.max_seq_length,
+           preln=False,
+           fp16=args.fp16,
+           huggingface=True)
 
     # Evaluation - we can ask to evaluate all the checkpoints (sub-directories) in a directory
     results = {}
@@ -810,9 +886,9 @@ def main():
         for checkpoint in checkpoints:
             # Reload the model
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
-            model = AutoModelForQuestionAnswering.from_pretrained(checkpoint)  # , force_download=True)
-            model.to(args.device)
-
+            # model = AutoModelForQuestionAnswering.from_pretrained(checkpoint)  # , force_download=True)
+            # model.to(args.device)
+            
             # Evaluate
             result = evaluate(args, model, tokenizer, prefix=global_step)
 
